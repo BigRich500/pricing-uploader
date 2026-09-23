@@ -5,88 +5,59 @@ pricing_uploader.py
 Python replacement for the "Load_Files_To_Staging" VBA macro in
 Pricing_uploader_multiFile.xlsm.
 
-WHAT IT DOES (mirrors the macro row-for-row):
+WHAT IT DOES:
 
-  For every row (3..last) on the "File_uploader" control sheet:
-    1. Build the day's folder path from column D.
-    2. Read the "SMP Matrix (Euro) INPUT" sheet out of the file named in
-       column G  -> in-memory table "SMP_Matrix_LBE"
-    3. Read the "SMP Matrix (Euro) INPUT" sheet out of the file named in
-       column E  -> in-memory table "Pricing_SMP_Matrix_LBE"
-    4. Read the "Euros" sheet out of the file named in column I
-       -> in-memory table "DC_Prices"
-    5. DELETE FROM the three staging.* tables in SQL Server (matches the
-       macro exactly -- it uses DELETE, not TRUNCATE).
-    6. Bulk-insert the three in-memory tables into SQL Server, using the
-       table names resolved from columns H, F and J.
-    7. EXEC dbo.Process_Pricing_Data.
+  For every line in files.csv (Business Date, Pricing SMP Matrix File,
+  SMP Matrix File, DC Prices File):
+    1. Build the day's folder from the date:
+         \\\\eh-fp-01.energia.local\\trading\\Day Folders\\YYYYMM\\DD\\
+    2. Read the "SMP Matrix (Euro) INPUT" sheet out of the SMP Matrix file
+       and the Pricing SMP Matrix file, and the "Euros" sheet out of the
+       DC Prices file.
+    3. DELETE FROM the three staging.* tables in SQL Server.
+    4. Bulk-insert the three files into the staging tables (see UPLOAD_PLAN).
+    5. EXEC dbo.Process_Pricing_Data.
+
+  A failure on one day is logged and skipped; the run carries on with the
+  next day, like the macro's On Error Resume Next per-row behaviour.
 
 WHY THIS IS FASTER THAN THE MACRO:
-  - The macro inserts one row at a time with cn.Execute "INSERT ... VALUES (...)"
-    built as a giant string. For a ~1900-row matrix file that's ~1900 separate
-    network round trips to SQL Server, per file, per day. This script uses
-    pyodbc's fast_executemany, which batches the same inserts into a handful
-    of round trips.
+  - The macro inserts one row at a time with cn.Execute "INSERT ... VALUES (...)".
+    For a ~1900-row matrix file that's ~1900 separate network round trips to
+    SQL Server, per file, per day. This script uses pyodbc's
+    fast_executemany, which batches the same inserts into a handful of
+    round trips.
   - Source workbooks are opened with openpyxl in read_only mode, which is
-    dramatically faster than a full Excel Application/Workbook open, and it
-    never launches Excel or shows any UI.
-  - Values are passed to SQL Server as native Python types (through bound
-    parameters) instead of being hand-formatted into a SQL string, which
-    removes the string-building/locale-formatting VBA had to do.
+    much faster than a full Excel Workbooks.Open and never launches Excel.
 
 WHAT IT DELIBERATELY PRESERVES FROM THE MACRO (do not "fix" without asking):
-  - The staging.* tables that are cleared are always the same 3 fixed names,
-    regardless of what the control sheet's H/F/J cells say.
-  - The table-name *assignment* looks swapped versus the sheet's own column
-    headers: the sheet built from column G ("SMP_Matrix_LBE" in-memory table)
-    is uploaded to the table named in column H, and the sheet built from
-    column E ("Pricing_SMP_Matrix_LBE" in-memory table) is uploaded to the
-    table named in column F. In the sample workbook, H resolves to
-    "staging.Pricing_SMP_Matrix_LBE" and F resolves to "staging.SMP_Matrix_LBE"
-    -- i.e. crossed relative to the in-memory table names. This script
-    reproduces that exact crossing (see UPLOAD_PLAN below) because the macro
-    does it that way. If this is actually a long-standing bug in the macro,
-    flip UPLOAD_PLAN, but that's a decision for you, not something to guess at.
-  - A failure on one day's row is logged and skipped, exactly like the
-    macro's On Error Resume Next per-row behaviour; the run continues with
-    the next row.
+  - The crossed table mapping: the "SMP Matrix" file goes into
+    staging.Pricing_SMP_Matrix_LBE and the "Pricing SMP Matrix" file goes
+    into staging.SMP_Matrix_LBE. That's what the macro did on every row of
+    the control sheet. If it's a long-standing bug, flip UPLOAD_PLAN.
   - The "LastRow" sentinel logic for matrix files (stop at the row where
     column A == 0, else fall back to the last non-blank cell in column A)
     and the fixed "AX" last-column boundary for matrix files.
   - The DC Prices file's fixed layout: data lives in B5:F<lastrow of col C>.
 
 REQUIREMENTS (install on the work PC):
-    pip install openpyxl pyodbc
-    -> also needs "ODBC Driver 17 (or 18) for SQL Server" installed on
-       Windows (usually already present on a machine that has SSMS/Excel
-       ODBC connections working). Integrated/Windows auth is used, same as
-       the macro's "Integrated Security=SSPI".
+    pip install -r requirements.txt
+    -> also needs "ODBC Driver 18 for SQL Server". Windows authentication
+       is used, same as the macro's "Integrated Security=SSPI".
 
 USAGE:
-    python pricing_uploader.py --control "Pricing_uploader_multiFile.xlsm"
-
-    Useful options:
-      --dry-run           Parse everything, print what WOULD happen, touch
-                           no SQL. Use this first on a new machine.
-      --row 5              Process only control-sheet row 5.
-      --row 5:20            Process rows 5 through 20 inclusive.
-      --workers 4          Read that many source-file trios in parallel
-                           (network I/O bound; SQL writes stay sequential
-                           and in the original row order).
-      --log-file run.log   Also write the log to a file.
+    python pricing_uploader.py                Upload every day in files.csv
+    python pricing_uploader.py --dry-run      Read the files, touch no SQL
+    python pricing_uploader.py --test-connection
 
     Run "python pricing_uploader.py --help" for the full list.
-
-    See README.md for a full step-by-step setup and verification checklist
-    (installing dependencies, finding your ODBC driver, testing the SQL
-    connection, dry-running against real files, etc.) before a first real
-    run on the work PC.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import csv
 import datetime
 import getpass
 import logging
@@ -105,10 +76,18 @@ from openpyxl.utils import column_index_from_string
 # SQL Server connection details (same server/database the macro used).
 SQL_SERVER = "ENR-HVH-EGL-02"
 SQL_DATABASE = "FODB"
+ODBC_DRIVER = "ODBC Driver 18 for SQL Server"
 
-# Fixed staging tables that get cleared before every day's upload
-# (matches Clear_Staging_Tables in the macro -- these are literal, not
-# read from the control sheet).
+# Each day's files live in <DAY_FOLDERS_ROOT>\YYYYMM\DD\ (the same folder
+# the control sheet's column D formula built).
+DAY_FOLDERS_ROOT = r"\\eh-fp-01.energia.local\trading\Day Folders"
+
+# The list of days to upload, one line per day. Looked for next to this
+# script unless --csv says otherwise.
+DEFAULT_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files.csv")
+CSV_DATE_FORMATS = ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y")
+
+# Staging tables cleared before every day's upload.
 STAGING_TABLES_TO_CLEAR = [
     "staging.SMP_Matrix_LBE",
     "staging.Pricing_SMP_Matrix_LBE",
@@ -121,24 +100,13 @@ STORED_PROCEDURE = "dbo.Process_Pricing_Data"
 MATRIX_SOURCE_SHEET = "SMP Matrix (Euro) INPUT"
 DC_PRICES_SOURCE_SHEET = "Euros"
 
-# Control-sheet name/layout inside the .xlsm.
-CONTROL_SHEET = "File_uploader"
-CONTROL_FIRST_ROW = 3
-COL_FOLDER = "D"
-COL_PRICING_FILE = "E"      # -> loaded as "Pricing_SMP_Matrix_LBE"
-COL_PRICING_TABLE = "F"     # -> SQL table that the *SMP_Matrix_LBE* sheet goes to
-COL_MATRIX_FILE = "G"       # -> loaded as "SMP_Matrix_LBE"
-COL_MATRIX_TABLE = "H"      # -> SQL table that the *Pricing_SMP_Matrix_LBE* sheet goes to
-COL_DC_FILE = "I"           # -> loaded as "DC_Prices"
-COL_DC_TABLE = "J"          # -> SQL table that the DC_Prices sheet goes to
-
-# The macro's exact (crossed) mapping of "in-memory table" -> "SQL table
-# column it reads its destination name from". See the big docstring above.
+# The macro's exact (crossed) mapping of source file -> staging table.
+# See the docstring above before changing it.
 UPLOAD_PLAN = [
-    # (in-memory table name,        control-sheet column with the SQL table name)
-    ("SMP_Matrix_LBE", COL_MATRIX_TABLE),      # H
-    ("Pricing_SMP_Matrix_LBE", COL_PRICING_TABLE),  # F
-    ("DC_Prices", COL_DC_TABLE),                # J
+    # (in-memory table name,     SQL table it is inserted into)
+    ("SMP_Matrix_LBE", "staging.Pricing_SMP_Matrix_LBE"),
+    ("Pricing_SMP_Matrix_LBE", "staging.SMP_Matrix_LBE"),
+    ("DC_Prices", "staging.DC_Prices"),
 ]
 
 AX_COLUMN_INDEX = column_index_from_string("AX")  # 50 -- matrix file last column
@@ -161,9 +129,8 @@ class LoadedTable:
 
 
 @dataclass
-class RowResult:
-    row: int
-    business_date: Any
+class DayResult:
+    business_date: datetime.date
     ok: bool
     message: str = ""
 
@@ -288,15 +255,24 @@ def load_dc_prices_file(full_path: str, target_name: str, uploaded_by: str,
 # SQL Server helpers
 # --------------------------------------------------------------------------
 
-def get_connection(sql_server: str = SQL_SERVER, sql_database: str = SQL_DATABASE,
-                    driver: str = "ODBC Driver 17 for SQL Server"):
+# --------------------------------------------------------------------------
+# SQL Server helpers
+# --------------------------------------------------------------------------
+
+def get_connection(sql_server: str = SQL_SERVER, sql_database: str = SQL_DATABASE):
     import pyodbc  # imported lazily so --dry-run works without pyodbc installed
 
+    # Driver 18 encrypts by default and rejects the self-signed certificates
+    # internal SQL Servers usually have. TrustServerCertificate keeps the
+    # connection encrypted but skips the certificate check, which is what
+    # Driver 17 and the macro's SQLOLEDB connection were already doing.
     conn_str = (
-        f"DRIVER={{{driver}}};"
+        f"DRIVER={{{ODBC_DRIVER}}};"
         f"SERVER={sql_server};"
         f"DATABASE={sql_database};"
         f"Trusted_Connection=yes;"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=yes;"
     )
     conn = pyodbc.connect(conn_str, autocommit=False)
     return conn
@@ -356,172 +332,158 @@ def run_stored_procedure(conn) -> None:
     conn.commit()
 
 
-def list_odbc_drivers() -> list[str]:
-    import pyodbc
-    return [d for d in pyodbc.drivers() if "SQL Server" in d]
-
-
 # --------------------------------------------------------------------------
-# Control-sheet reading
+# files.csv reading
 # --------------------------------------------------------------------------
 
 @dataclass
-class ControlRow:
-    row: int
-    business_date: Any
-    folder_path: str
+class DayFiles:
+    line: int
+    business_date: datetime.date
     pricing_file: str
-    pricing_table: str
     matrix_file: str
-    matrix_table: str
     dc_file: str
-    dc_table: str
+
+    @property
+    def folder(self) -> str:
+        return day_folder(DAY_FOLDERS_ROOT, self.business_date)
 
 
-def read_control_rows(control_path: str, only_rows: Optional[tuple[int, int]] = None) -> list[ControlRow]:
-    wb = openpyxl.load_workbook(control_path, read_only=True, data_only=True)
+def day_folder(root: str, business_date: datetime.date) -> str:
+    return os.path.join(root, business_date.strftime("%Y%m"), business_date.strftime("%d"))
+
+
+def parse_date(text: str) -> Optional[datetime.date]:
+    text = text.strip()
+    for fmt in CSV_DATE_FORMATS:
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def read_csv_lines(csv_path: str) -> list[list[str]]:
+    """Excel's plain "CSV (Comma delimited)" saves as Windows-1252, while
+    "CSV UTF-8" adds a byte-order mark; handle both."""
     try:
-        ws = wb[CONTROL_SHEET]
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            return list(csv.reader(f))
+    except UnicodeDecodeError:
+        with open(csv_path, newline="", encoding="cp1252") as f:
+            return list(csv.reader(f))
 
-        col_e_idx = column_index_from_string(COL_PRICING_FILE)
-        last_row = find_last_nonblank_row(ws, col_e_idx)
 
-        def cell(row: int, col_letter: str) -> Any:
-            return ws.cell(row=row, column=column_index_from_string(col_letter)).value
+def read_days(csv_path: str) -> list[DayFiles]:
+    """Reads files.csv. Raises ValueError listing every bad line, so a typo
+    stops the run before anything is uploaded."""
+    days: list[DayFiles] = []
+    errors: list[str] = []
 
-        results: list[ControlRow] = []
-        for r in range(CONTROL_FIRST_ROW, last_row + 1):
-            if only_rows is not None and not (only_rows[0] <= r <= only_rows[1]):
-                continue
+    for line_no, cells in enumerate(read_csv_lines(csv_path), start=1):
+        cells = [c.strip() for c in cells]
+        if not any(cells):
+            continue
 
-            folder = str(cell(r, COL_FOLDER) or "").strip()
-            if not folder:
-                continue
-            if not folder.endswith("\\") and not folder.endswith("/"):
-                folder += "\\"
+        business_date = parse_date(cells[0])
+        if business_date is None:
+            if line_no == 1:
+                continue  # header row
+            errors.append(f"line {line_no}: {cells[0]!r} is not a date (use DD/MM/YYYY)")
+            continue
 
-            def s(col_letter: str) -> str:
-                v = cell(r, col_letter)
-                return str(v).strip() if v is not None else ""
+        files = (cells + ["", "", ""])[1:4]
+        missing = [name for name, value in zip(
+            ("Pricing SMP Matrix File", "SMP Matrix File", "DC Prices File"), files) if not value]
+        if missing:
+            errors.append(f"line {line_no} ({cells[0]}): missing {', '.join(missing)}")
+            continue
 
-            results.append(ControlRow(
-                row=r,
-                business_date=cell(r, "C"),
-                folder_path=folder,
-                pricing_file=s(COL_PRICING_FILE),
-                pricing_table=s(COL_PRICING_TABLE),
-                matrix_file=s(COL_MATRIX_FILE),
-                matrix_table=s(COL_MATRIX_TABLE),
-                dc_file=s(COL_DC_FILE),
-                dc_table=s(COL_DC_TABLE),
-            ))
-        return results
-    finally:
-        wb.close()
+        days.append(DayFiles(line_no, business_date, *files))
+
+    if errors:
+        raise ValueError("Problems in " + csv_path + ":\n  " + "\n  ".join(errors))
+    return days
 
 
 # --------------------------------------------------------------------------
-# Per-row processing
+# Per-day processing
 # --------------------------------------------------------------------------
 
-def join_path(folder: str, filename: str) -> str:
-    return folder + filename
-
-
-def load_row_files(crow: ControlRow, uploaded_by: str, upload_date: datetime.datetime) -> dict[str, LoadedTable]:
-    """Reads the 3 source workbooks for one control-sheet row. Pure I/O +
-    parsing, no SQL -- safe to run in a worker thread."""
-    matrix_table = load_matrix_file(
-        join_path(crow.folder_path, crow.matrix_file),
-        "SMP_Matrix_LBE", uploaded_by, upload_date,
-    )
-    pricing_table = load_matrix_file(
-        join_path(crow.folder_path, crow.pricing_file),
-        "Pricing_SMP_Matrix_LBE", uploaded_by, upload_date,
-    )
-    dc_table = load_dc_prices_file(
-        join_path(crow.folder_path, crow.dc_file),
-        "DC_Prices", uploaded_by, upload_date,
-    )
+def load_day_files(day: DayFiles, uploaded_by: str, upload_date: datetime.datetime) -> dict[str, LoadedTable]:
+    """Reads the 3 source workbooks for one day. Pure I/O + parsing, no
+    SQL -- safe to run in a worker thread."""
     return {
-        "SMP_Matrix_LBE": matrix_table,
-        "Pricing_SMP_Matrix_LBE": pricing_table,
-        "DC_Prices": dc_table,
+        "SMP_Matrix_LBE": load_matrix_file(
+            os.path.join(day.folder, day.matrix_file),
+            "SMP_Matrix_LBE", uploaded_by, upload_date),
+        "Pricing_SMP_Matrix_LBE": load_matrix_file(
+            os.path.join(day.folder, day.pricing_file),
+            "Pricing_SMP_Matrix_LBE", uploaded_by, upload_date),
+        "DC_Prices": load_dc_prices_file(
+            os.path.join(day.folder, day.dc_file),
+            "DC_Prices", uploaded_by, upload_date),
     }
 
 
-def resolve_sql_table_name(crow: ControlRow, column_letter: str) -> str:
-    mapping = {
-        COL_MATRIX_TABLE: crow.matrix_table,
-        COL_PRICING_TABLE: crow.pricing_table,
-        COL_DC_TABLE: crow.dc_table,
-    }
-    return mapping[column_letter]
-
-
-def process_row(conn, crow: ControlRow, tables: dict[str, LoadedTable],
-                 dry_run: bool, log: logging.Logger) -> RowResult:
+def process_day(conn, day: DayFiles, tables: dict[str, LoadedTable],
+                dry_run: bool, log: logging.Logger) -> DayResult:
     try:
         if dry_run:
-            for name in ("SMP_Matrix_LBE", "Pricing_SMP_Matrix_LBE", "DC_Prices"):
+            for name, dest in UPLOAD_PLAN:
                 t = tables[name]
-                log.info(f"  [dry-run] {name}: {len(t.rows)} rows from {t.source_file!r}")
-            for in_memory_name, table_col in UPLOAD_PLAN:
-                dest = resolve_sql_table_name(crow, table_col)
-                log.info(f"  [dry-run] would insert {in_memory_name} -> {dest}")
+                log.info(f"  [dry-run] {len(t.rows)} rows from {t.source_file!r} -> {dest}")
             log.info(f"  [dry-run] would EXEC {STORED_PROCEDURE}")
-            return RowResult(crow.row, crow.business_date, True, "dry-run")
+            return DayResult(day.business_date, True, "dry-run")
 
         clear_staging_tables(conn)
 
-        for in_memory_name, table_col in UPLOAD_PLAN:
-            dest_table = resolve_sql_table_name(crow, table_col)
-            if not dest_table:
-                raise ValueError(f"No destination SQL table name in column {table_col} for row {crow.row}")
-            n = upload_table(conn, dest_table, tables[in_memory_name])
-            log.info(f"  inserted {n} rows into {dest_table} (from {in_memory_name})")
+        for name, dest in UPLOAD_PLAN:
+            n = upload_table(conn, dest, tables[name])
+            log.info(f"  inserted {n} rows into {dest} (from {tables[name].source_file!r})")
 
         run_stored_procedure(conn)
 
-        return RowResult(crow.row, crow.business_date, True)
+        return DayResult(day.business_date, True)
     except Exception as exc:  # mirrors the macro's On Error Resume Next per-row
         try:
             conn.rollback()
         except Exception:
             pass
-        return RowResult(crow.row, crow.business_date, False, str(exc))
+        return DayResult(day.business_date, False, str(exc))
 
 
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
-def parse_row_range(spec: Optional[str]) -> Optional[tuple[int, int]]:
-    if not spec:
-        return None
-    if ":" in spec:
-        a, b = spec.split(":", 1)
-        return (int(a), int(b))
-    r = int(spec)
-    return (r, r)
+def date_arg(text: str) -> datetime.date:
+    d = parse_date(text)
+    if d is None:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a date (use DD/MM/YYYY)")
+    return d
 
 
 def main() -> int:
+    global DAY_FOLDERS_ROOT
+
     parser = argparse.ArgumentParser(description="Python replacement for Load_Files_To_Staging macro")
-    parser.add_argument("--control", help="Path to Pricing_uploader_multiFile.xlsm (not needed with --list-odbc-drivers or --test-connection)")
-    parser.add_argument("--dry-run", action="store_true", help="Parse files and print what would happen; no SQL")
-    parser.add_argument("--row", help="Only process one control-sheet row (e.g. 5) or a range (e.g. 5:20)")
+    parser.add_argument("--csv", default=DEFAULT_CSV,
+                        help="List of days and file names (default: files.csv next to this script)")
+    parser.add_argument("--dry-run", action="store_true", help="Read the files and print what would happen; no SQL")
+    parser.add_argument("--date", type=date_arg, help="Only upload this one day (DD/MM/YYYY)")
+    parser.add_argument("--from", dest="date_from", type=date_arg, help="Only upload days on or after this date")
+    parser.add_argument("--to", dest="date_to", type=date_arg, help="Only upload days on or before this date")
     parser.add_argument("--workers", type=int, default=1, help="Parallel source-file readers (I/O bound; default 1)")
+    parser.add_argument("--root", default=DAY_FOLDERS_ROOT, help=f"Day folders location (default {DAY_FOLDERS_ROOT})")
     parser.add_argument("--server", default=SQL_SERVER, help=f"SQL Server host (default {SQL_SERVER})")
     parser.add_argument("--database", default=SQL_DATABASE, help=f"SQL Server database (default {SQL_DATABASE})")
-    parser.add_argument("--driver", default="ODBC Driver 17 for SQL Server", help="ODBC driver name")
     parser.add_argument("--log-file", help="Also write log output to this file")
     parser.add_argument("--uploaded-by", default=None, help="Overrides Environ('USERNAME'); defaults to the current OS user")
-    parser.add_argument("--list-odbc-drivers", action="store_true",
-                         help="Print installed SQL Server ODBC drivers and exit (use this to find the right --driver value)")
     parser.add_argument("--test-connection", action="store_true",
-                         help="Just open and close a connection to SQL Server, then exit (like the macro's Test_SQL_Connection)")
+                        help="Just open and close a connection to SQL Server, then exit")
     args = parser.parse_args()
+    DAY_FOLDERS_ROOT = args.root
 
     log = logging.getLogger("pricing_uploader")
     log.setLevel(logging.INFO)
@@ -534,106 +496,101 @@ def main() -> int:
         fh.setFormatter(fmt)
         log.addHandler(fh)
 
-    if args.list_odbc_drivers:
+    def connect():
         try:
-            drivers = list_odbc_drivers()
+            return get_connection(args.server, args.database)
         except ImportError:
-            log.error("pyodbc is not installed. Run: pip install pyodbc")
-            return 1
-        if drivers:
-            log.info("Installed SQL Server ODBC drivers:")
-            for d in drivers:
-                log.info(f"  {d!r}")
-        else:
-            log.warning("No SQL Server ODBC drivers found. Install 'ODBC Driver 17 for SQL Server' "
-                        "(or 18) from Microsoft's download page, or ask IT to install it.")
-        return 0
+            log.error("pyodbc is not installed. Run: pip install -r requirements.txt")
+        except Exception as exc:
+            log.error(f"Could not connect to {args.server}/{args.database}: {exc}")
+            if "IM002" in str(exc):
+                log.error(f"'{ODBC_DRIVER}' is not installed. Install it from Microsoft "
+                          "(search 'ODBC Driver 18 for SQL Server download') or ask IT.")
+        return None
 
     if args.test_connection:
-        log.info(f"Connecting to {args.server}/{args.database} using driver {args.driver!r} ...")
-        try:
-            conn = get_connection(args.server, args.database, args.driver)
-            conn.close()
-            log.info("Connected successfully.")
-            return 0
-        except Exception as exc:
-            log.error(f"Connection failed: {exc}")
-            log.error("Run with --list-odbc-drivers to see what's installed, and pass the exact "
-                      "name with --driver if it isn't 'ODBC Driver 17 for SQL Server'.")
+        log.info(f"Connecting to {args.server}/{args.database} using {ODBC_DRIVER} ...")
+        conn = connect()
+        if conn is None:
             return 1
+        conn.close()
+        log.info("Connected successfully.")
+        return 0
 
-    if not args.control:
-        parser.error("--control is required (unless using --list-odbc-drivers or --test-connection)")
+    if not os.path.exists(args.csv):
+        log.error(f"Can't find {args.csv}. Put files.csv next to the script, or pass --csv \"path\\to\\file.csv\".")
+        return 1
 
-    uploaded_by = args.uploaded_by or os.environ.get("USERNAME") or getpass.getuser()
-    only_rows = parse_row_range(args.row)
+    log.info(f"Reading days from {args.csv}")
+    try:
+        days = read_days(args.csv)
+    except ValueError as exc:
+        log.error(str(exc))
+        log.error("Nothing was uploaded. Fix the lines above and run again.")
+        return 1
 
-    log.info(f"Reading control sheet from {args.control}")
-    control_rows = read_control_rows(args.control, only_rows=only_rows)
-    log.info(f"{len(control_rows)} row(s) to process")
+    if args.date:
+        days = [d for d in days if d.business_date == args.date]
+    if args.date_from:
+        days = [d for d in days if d.business_date >= args.date_from]
+    if args.date_to:
+        days = [d for d in days if d.business_date <= args.date_to]
+    log.info(f"{len(days)} day(s) to process")
 
-    if not control_rows:
+    if not days:
         log.warning("Nothing to do.")
         return 0
 
     conn = None
     if not args.dry_run:
         log.info(f"Connecting to {args.server}/{args.database} ...")
-        try:
-            conn = get_connection(args.server, args.database, args.driver)
-        except Exception as exc:
-            log.error(f"Could not connect to SQL Server: {exc}")
-            log.error("Try: python pricing_uploader.py --list-odbc-drivers   (to find the right --driver value)")
-            log.error("Or:  python pricing_uploader.py --test-connection --driver \"...\"")
+        conn = connect()
+        if conn is None:
+            log.error("Try: python pricing_uploader.py --test-connection")
             return 1
 
-    results: list[RowResult] = []
+    uploaded_by = args.uploaded_by or os.environ.get("USERNAME") or getpass.getuser()
+    results: list[DayResult] = []
 
-    def do_load(crow: ControlRow):
-        upload_date = datetime.datetime.now()
-        return crow, load_row_files(crow, uploaded_by, upload_date)
+    def do_load(day: DayFiles):
+        return load_day_files(day, uploaded_by, datetime.datetime.now())
+
+    def handle(day: DayFiles, loaded):
+        log.info(f"{day.business_date:%d/%m/%Y} ({day.folder}):")
+        if isinstance(loaded, Exception):
+            log.error(f"  FAILED loading source files - {loaded}")
+            results.append(DayResult(day.business_date, False, str(loaded)))
+            return
+        results.append(process_day(conn, day, loaded, args.dry_run, log))
 
     if args.workers > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(do_load, crow): crow for crow in control_rows}
-            loaded_by_row = {}
-            for fut in concurrent.futures.as_completed(futures):
-                crow = futures[fut]
+            futures = [pool.submit(do_load, day) for day in days]
+            # Process in file order so SQL writes stay sequential/predictable.
+            for day, fut in zip(days, futures):
                 try:
-                    _, tables = fut.result()
-                    loaded_by_row[crow.row] = tables
+                    loaded = fut.result()
                 except Exception as exc:
-                    loaded_by_row[crow.row] = exc
-        # Process in original row order so SQL writes stay sequential/predictable.
-        for crow in control_rows:
-            log.info(f"Row {crow.row} (business date {crow.business_date}):")
-            loaded = loaded_by_row[crow.row]
-            if isinstance(loaded, Exception):
-                log.error(f"  FAILED loading source files - {loaded}")
-                results.append(RowResult(crow.row, crow.business_date, False, str(loaded)))
-                continue
-            results.append(process_row(conn, crow, loaded, args.dry_run, log))
+                    loaded = exc
+                handle(day, loaded)
     else:
-        for crow in control_rows:
-            log.info(f"Row {crow.row} (business date {crow.business_date}):")
+        for day in days:
             try:
-                _, tables = do_load(crow)
+                loaded = do_load(day)
             except Exception as exc:
-                log.error(f"  FAILED loading source files - {exc}")
-                results.append(RowResult(crow.row, crow.business_date, False, str(exc)))
-                continue
-            results.append(process_row(conn, crow, tables, args.dry_run, log))
+                loaded = exc
+            handle(day, loaded)
 
     if conn is not None:
         conn.close()
 
     ok = sum(1 for r in results if r.ok)
     failed = [r for r in results if not r.ok]
-    log.info(f"Done. {ok}/{len(results)} row(s) succeeded.")
+    log.info(f"Done. {ok}/{len(results)} day(s) succeeded.")
     if failed:
-        log.warning(f"{len(failed)} row(s) failed:")
+        log.warning(f"{len(failed)} day(s) failed:")
         for r in failed:
-            log.warning(f"  row {r.row} (business date {r.business_date}): {r.message}")
+            log.warning(f"  {r.business_date:%d/%m/%Y}: {r.message}")
 
     return 0 if not failed else 1
 
